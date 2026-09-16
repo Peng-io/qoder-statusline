@@ -1,16 +1,12 @@
 //! Qoder 状态栏渲染：从 stdin 读 JSON 状态输入，向 stdout 输出两行状态文本。
-//! 由 ~/.qoder/statusline-command.sh 移植而来，去掉对 bash / jq / awk 的运行时依赖。
+//! 由 ~/.qoder/statusline-command.sh 移植而来，去掉对 bash / jq / awk / git 的运行时依赖。
 
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 const BAR_WIDTH: usize = 10;
-
-/// CREATE_NO_WINDOW：spawn git 时隐藏控制台窗口，避免状态栏刷新时闪黑框
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn main() {
     let mut raw = String::new();
@@ -125,31 +121,102 @@ fn build_ctx_bar(pct: f64) -> String {
     bar
 }
 
+/// 复刻 `git symbolic-ref -q --short HEAD || git describe --tags --always`：从 cwd 逐级向上
+/// 找 `.git`，读 HEAD。不调用 git 命令，因此没有子进程。
+///
+/// 在分支上时 HEAD 是符号引用，取其分支名；detached HEAD 时 HEAD 存的是裸 SHA，改为找指向
+/// 该 commit 的 tag，找不到再退回 7 位短 SHA。worktree 与 submodule 的 `.git` 是文件，内容
+/// 形如 `gitdir: <路径>`，需顺着指向再读其 HEAD。
 fn git_branch(cwd: &str) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args([
-        "-C",
-        cwd,
-        "--no-optional-locks",
-        "symbolic-ref",
-        "--short",
-        "HEAD",
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut dir = Path::new(cwd);
+    loop {
+        let dot_git = dir.join(".git");
+        let git_dir = if dot_git.is_dir() {
+            dot_git
+        } else if dot_git.is_file() {
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let target = PathBuf::from(content.trim().strip_prefix("gitdir:")?.trim());
+            if target.is_absolute() {
+                target
+            } else {
+                dir.join(target)
+            }
+        } else {
+            dir = dir.parent()?;
+            continue;
+        };
+
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+        let head = head.trim();
+        if let Some(name) = head.strip_prefix("ref: refs/heads/") {
+            return Some(name.to_string());
+        }
+        if !head.is_empty() && head.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // detached：有 tag 指向该 commit 就显示 tag 名，没有则退回 7 位短 SHA
+            return Some(
+                find_tag(&git_dir, head).unwrap_or_else(|| head.chars().take(7).collect()),
+            );
+        }
+        return None;
     }
-    let output = cmd.output().ok()?;
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if output.status.success() && !branch.is_empty() {
-        Some(branch)
-    } else {
-        None
+}
+
+/// 在 tag 引用里找指向 `sha` 的那个，同时覆盖松散引用与 packed-refs。
+///
+/// 已知局限：松散的附注 tag（refs/tags 下未打包、值是 tag object SHA 的文件）需要解析对象库
+/// 才能解引用，这里匹配不到。打包进 packed-refs 的 tag 带 `^` 行给出 peeled commit，可以正常
+/// 匹配，而 clone 来的仓库 tag 基本都是这一种。
+fn find_tag(git_dir: &Path, sha: &str) -> Option<String> {
+    if let Some(name) = find_loose_tag(&git_dir.join("refs/tags"), sha) {
+        return Some(name);
     }
+
+    let text = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    // `^` 行是上一行附注 tag 解引用后的 commit，用 pending 记住那个 tag 名
+    let mut pending: Option<&str> = None;
+    for line in text.lines() {
+        if let Some(peeled) = line.strip_prefix('^') {
+            if peeled.trim() == sha
+                && let Some(name) = pending
+            {
+                return Some(name.to_string());
+            }
+            pending = None;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((value, name)) = line.split_once(' ') else {
+            continue;
+        };
+        pending = name.strip_prefix("refs/tags/");
+        if value == sha
+            && let Some(name) = pending
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// 递归扫描 refs/tags 下的松散引用，返回相对 `refs/tags` 的 tag 名（tag 名可含 `/`，
+/// 如 `release/v2.0.3`）
+fn find_loose_tag(dir: &Path, sha: &str) -> Option<String> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if let Some(found) = find_loose_tag(&path, sha) {
+                // 用 `/` 手工拼接而非 Path::join：git ref 名必须以 `/` 分隔，
+                // 而 join 在 Windows 上会给出 `\`
+                return Some(format!("{name}/{found}"));
+            }
+        } else if std::fs::read_to_string(&path).is_ok_and(|c| c.trim() == sha) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// 把 home 前缀折叠为 ~。原 bash 脚本的 sed 替换在 Windows 路径下不生效，这里做了修正。
