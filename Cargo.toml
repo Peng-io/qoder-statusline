@@ -1,0 +1,15 @@
+[package]
+name = "statusline"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+
+# 体积优化：本地小工具优先压体积——opt-level=s、剥离符号、LTO 收紧死代码；panic 用 abort，状态栏场景无需 unwind
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
