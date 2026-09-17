@@ -55,16 +55,17 @@ cp target/release/statusline.exe ~/.qoder/statusline.exe
 ## 设计说明
 
 - **零子进程**：原 bash 版每次刷新要启动十几次 `jq`，外加 `awk`、`git` 子进程；Rust 版一个进程做完，git 信息改为直接读 `.git` 下的文件。其中那次 `git symbolic-ref` 本机实测占约 24ms，去掉后单次渲染从 39ms 降到 15ms（空转基线 16ms），已贴到进程创建的地板。
-- **git 读取方式**：从 cwd 逐级向上找 `.git` 并读其 `HEAD`——在分支上取符号引用的分支名；detached HEAD 时找指向该 commit 的 tag，找不到退回 7 位短 SHA。同时覆盖松散引用与 packed-refs（含附注 tag 的 `^` peeled 行），以及 worktree / submodule 的 `gitdir:` 指针。
+- **git 读取方式**：从 cwd 逐级向上找 `.git` 并读其 `HEAD`——在分支上取符号引用的分支名；detached HEAD 时找指向该 commit 的 tag（附注 tag 读对象库解引用：松散对象、pack 内完整对象、packed-refs 的 `^` 解引发行都覆盖），找不到退回 7 位短 SHA。同时覆盖松散引用与 packed-refs，以及 worktree / submodule 的 `gitdir:` 指针。
 - **行为对齐**：除 detached HEAD 一处外，输出与原脚本逐字节一致（含空输入、缺字段等边界情况）。原脚本在 detached HEAD 时 `symbolic-ref` 失败、整段不显示分支，现在会显示 tag 或短 SHA。另修正了原脚本在 Windows 下 `~` 路径折叠不生效的问题。
-- **已知局限**：tag 只做精确匹配，detached 在无 tag 的提交上比 `git describe --tags --always` 少一个「最近 tag + 距离」的回溯；未打包的松散附注 tag 需解析对象库才能解引用，匹配不到（clone 来的仓库 tag 基本都是打包的）。
-- **体积**：release 配置启用 `strip` / LTO / `codegen-units=1` / `panic="abort"` / `opt-level="s"`，产物约 400KB。
+- **已知局限**：tag 只做精确匹配，detached 在无 tag 的提交上比 `git describe --tags --always` 少一个「最近 tag + 距离」的回溯；delta 存储的 tag 对象与 idx v1 包不解析，退回 7 位短 SHA（实测多个真实仓库的 tag 对象均以完整对象存储）。
+- **体积**：release 配置启用 `strip` / LTO / `codegen-units=1` / `panic="abort"` / `opt-level="s"`，产物约 360KB。
 - **跨平台**：代码无平台特定逻辑，纯 std + serde_json。
 - **唯一依赖**：[serde_json](https://crates.io/crates/serde_json)。
 
 ## 项目结构
 
 ```text
-src/main.rs   # 全部逻辑
-Cargo.toml    # 含 release 体积优化配置
+src/main.rs     # 状态栏逻辑与 git 元信息读取
+src/inflate.rs  # 极简 zlib 解压（读 git 对象用），含单元测试
+Cargo.toml      # 含 release 体积优化配置
 ```
